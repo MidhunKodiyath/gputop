@@ -41,15 +41,6 @@ function GputopUI () {
                 bottom: 20,
                 left: 20
             },
-            // dont know what this is for?!
-            markings: function(axes) {
-                var markings = [];
-                var xaxis = axes.xaxis;
-                for (var x = Math.floor(xaxis.min); x < xaxis.max; x += xaxis.tickSize * 2) {
-                    markings.push({ xaxis: { from: x, to: x + xaxis.tickSize }, color: "rgba(232, 232, 255, 0.2)" });
-                }
-                return markings;
-            }
         },
         xaxis: {
             show: false,
@@ -63,6 +54,8 @@ function GputopUI () {
         }
     };// options
 
+    this.zoom = 10; //seconds
+
     this.series = [{
         lines: {
             fill: true
@@ -75,11 +68,83 @@ function GputopUI () {
 
 }
 
-GputopUI.prototype.update_slider_period = function(period_) {
-    slider.setValue(period_);
+
+function create_default_markings(xaxis) {
+    var markings = [];
+    for (var x = Math.floor(xaxis.min); x < xaxis.max; x += xaxis.tickSize * 2) {
+        markings.push({ xaxis: { from: x, to: x + xaxis.tickSize }, color: "rgba(232, 232, 255, 0.2)" });
+    }
+    return markings;
 }
 
+
+/* FIXME: this isn't a good place for code relating to fiddly OA exponent details
+ */
+function max_exponent_below(nsec) {
+    for (var i = 0; i < 64; i++) {
+        var period = (1<<i) * 1000000000 / gputop.devinfo.get_timestamp_frequency();
+
+        if (period > nsec)
+            return Math.max(0, i - 1);
+    }
+
+    return i;
+}
+
+
+/* returns true if the exponent changed and therefore the metric
+ * stream needs to be re-opened, else false.
+ */
+function update_metric_period_exponent_for_zoom(metric) {
+    var hack_graph_size_px = 1000;
+
+    /* We want to set an aggregation period such that we get ~1 update per
+     * x-axis-pixel on the trace graph.
+     *
+     * We need to ensure the HW sampling period is low enough to expect two HW
+     * samples per x-axis-pixel.
+     *
+     * FIXME: actually determine how wide the graphs are in pixels instead of
+     * assuming 1000 pixels.
+     */
+
+    var ns_per_pixel = gputop_ui.zoom * 1000000000 / hack_graph_size_px;
+
+    /* XXX: the way we make side-band changes to the metric object while its
+     * still open seems fragile.
+     *
+     * E.g. directly lowering the aggregation period potentially lower than the
+     * HW sampling period won't be meaningful.
+     *
+     * These changes should be done in terms of opening a new stream of metrics
+     * which happens asynchronously after the current stream has closed and the
+     * new, pending configuration shouldn't have any affect on any currently
+     * open stream.
+     */
+    gputop.update_period(global_guid, ns_per_pixel);
+    var exponent = max_exponent_below(ns_per_pixel);
+
+    if (metric.exponent != exponent) {
+        metric.exponent = exponent;
+        return true;
+    } else
+        return false;
+}
+
+
+GputopUI.prototype.set_zoom = function(zoom) {
+    gputop_ui.zoom = zoom;
+
+    var metric = gputop.get_map_metric(global_guid);
+
+    if (update_metric_period_exponent_for_zoom(metric))
+        gputop.open_oa_query_for_trace(global_guid);
+}
+
+
 GputopUI.prototype.display_graph = function(timestamp) {
+    var metric = gputop.get_map_metric(global_guid);
+
     for (var i = 0; i < this.graph_array.length; ++i) {
         var container = "#" + this.graph_array[i];
         var counter = $(container).data("counter");
@@ -95,21 +160,69 @@ GputopUI.prototype.display_graph = function(timestamp) {
 
         var elapsed = (timestamp - this.start_timestamp) * 1000000; // elapsed time from the very begining
 
-        x_max = this.start_gpu_timestamp + elapsed;
-        x_min = x_max - 10000000000; // 10 seconds time interval
+        var time_range = this.zoom * 1000000000;
+        var margin = time_range * 0.1;
 
-        // remove the older than 10 seconds samples from the graph data
+        x_max = this.start_gpu_timestamp + elapsed;
+        x_min = x_max - time_range;
+
+        // remove the old samples from the graph data
         for (var j = 0; j < counter.graph_data.length &&
-            counter.graph_data[j][0] < (x_min / 100000) - 10000; j++) {}
+            counter.graph_data[j][0] < x_min; j++) {}
         if (j > 0)
             counter.graph_data = counter.graph_data.slice(j);
+
+        // remove old markings from the graph
+        for (var j = 0; j < counter.graph_markings.length &&
+             counter.graph_markings[j].xaxis.from < x_min; j++) {}
+        if (j > 0)
+            counter.graph_markings = counter.graph_markings.slice(j);
 
         var save_index = -1;
         for (var j = 0; j < length; j++) {
             var start = counter.updates[j][0];
             var end = counter.updates[j][1];
-            var val = counter.updates[j][2]; // value
-            counter.graph_data.push([start / 100000, val]);
+            var val = counter.updates[j][2];
+            var max = counter.updates[j][3];
+
+            var mid = start + (end - start) / 2;
+
+            /* We don't have a nice way to share an enum between Emscripten/C
+             * and JS a.t.m, so here's what the reason values mean:
+             *
+             *   1<<0 = periodic update
+             *   1<<1 = context switch to
+             *   1<<2 = context switch away
+             *
+             * When in per-context mode then when we get a context switch away
+             * we want to show the counter as zero until the next context
+             * switch back.
+             *
+             * We also use the reason to add lines markingthe context switches.
+             */
+            var reason = counter.updates[j][4];
+
+            /* FIXME we should stop assuming all counters are a percentage */
+            var percent = 100 * val / max;
+
+            if (reason & 0x2) {
+                counter.graph_data.push([start, 0]);
+                console.log("switch to");
+            }
+
+            counter.graph_data.push([mid, percent]);
+
+            if (reason & 0x4) {
+                counter.graph_data.push([end, 0]);
+                console.log("switch from");
+            }
+
+            // mark context switches...
+            if (reason & 0x6) {
+                counter.graph_markings.push({ xaxis: { from: mid, to: mid },
+                                              color: "#bb0000" });
+            }
+
             save_index = j;
         }
 
@@ -121,8 +234,13 @@ GputopUI.prototype.display_graph = function(timestamp) {
         }
 
         // adjust the min and max (start and end of the graph)
-        this.graph_options.xaxis.min = (x_min / 100000);
-        this.graph_options.xaxis.max = (x_max / 100000) - 10000;
+        this.graph_options.xaxis.min = x_min + margin;
+        this.graph_options.xaxis.max = x_max - margin;
+        this.graph_options.xaxis.label = this.zoom + ' seconds';
+
+        var default_markings = create_default_markings(this.graph_options.xaxis);
+        this.graph_options.grid.markings = default_markings.concat(counter.graph_markings);
+
         this.series[0].data = counter.graph_data;
         $.plot(container, this.series, this.graph_options);
 
@@ -133,16 +251,9 @@ GputopUI.prototype.display_graph = function(timestamp) {
 
 
 GputopUI.prototype.display_counter = function(counter) {
-    if (counter.invalidate_ == false)
-        return;
-
-    if (counter.data_.length == 0)
-        return;
-
-    var delta = counter.data_.shift();
-    var d_value = counter.data_.shift();
-    var max = counter.data_.shift();
-    var t_val = d_value;
+    var bar_value = counter.latest_value;
+    var text_value = counter.latest_value;
+    var max = counter.latest_max;
     var units = " " + counter.units;
     var unit = units;
     var dp = 0;
@@ -155,40 +266,35 @@ GputopUI.prototype.display_counter = function(counter) {
                  " hz":["Hz", "KHz", "MHz", "GHz"],
                  " texels":[" texels", " K texels", " M texels", " G texels"],
                  " pixels":[" pixels", " K pixels", " M pixels", " G pixels"]};
+
     if (units == " messages")
         unit = "";
-    if (units == " us")
-    {
+
+    if (units == " us") {
         units = " ns";
         unit = units;
-        d_value *= 1000;
+        text_value *= 1000;
     }
 
-    if (units == " mhz")
-    {
+    if (units == " mhz") {
         units = " hz";
         unit = units;
-        d_value *= 1000000;
+        text_value *= 1000000;
     }
 
-    if ((units in scale))
-    {
+    if ((units in scale)) {
         dp = 2;
-        unit = scale[units][0];
-        if (d_value >= giga)
-        {
+        if (text_value >= giga) {
             unit = scale[units][3];
-            d_value /= giga;
-        }
-        if (d_value >= mega)
-        {
+            text_value /= 1000000000;
+        } else if (text_value >= mega) {
             unit = scale[units][2];
-            d_value /= mega;
-        }
-        if (d_value >= kilo)
-        {
+            text_value /= 1000000;
+        } else if (text_value >= kilo) {
             unit = scale[units][1];
-            d_value /= kilo;
+            text_value /= 1000;
+        } else {
+            unit = scale[units][0];
         }
     }
 
@@ -199,11 +305,10 @@ GputopUI.prototype.display_counter = function(counter) {
         counter.div_txt_ = $('#'+counter.div_txt_id_ );
 
     if (max != 0) {
-        var value = 100 * t_val / max;
-        counter.div_.css("width", value + "%");
-        counter.div_txt_.text(d_value.toFixed(dp) + unit);// + " " +counter.samples_);
+        counter.div_.css("width", 100 * bar_value / max + "%");
+        counter.div_txt_.text(text_value.toFixed(dp) + unit);// + " " +counter.samples_);
     } else {
-        counter.div_txt_.text(d_value.toFixed(dp) + unit);// + " " +counter.samples_);
+        counter.div_txt_.text(text_value.toFixed(dp) + unit);// + " " +counter.samples_);
         counter.div_.css("width", "0%");
     }
 }
@@ -222,6 +327,7 @@ GputopUI.prototype.window_render_animation_bars = function(timestamp) {
 
     window.requestAnimationFrame(gputop_ui.window_render_animation_bars);
 
+    /* TODO: defer updating the bar graphs to the animation callback */
     for (var i = 0, l = metric.emc_counters_.length; i < l; i++) {
         var counter = metric.emc_counters_[i];
         gputop_ui.display_counter(counter);
@@ -232,7 +338,9 @@ GputopUI.prototype.metric_not_supported = function(metric) {
     alert(" Metric not supported " + metric.title_)
 }
 
-GputopUI.prototype.display_features = function(features) {
+/* XXX: this is essentially the first entry point into GputopUI after
+ * connecting to the server, after Gputop has been initialized */
+GputopUI.prototype.update_features = function(features) {
     if (features.devinfo.get_devid() == 0 ) {
         gputop_ui.show_alert(" No device was detected, is it the functionality on kernel ? ","alert-danger");
     }
@@ -253,6 +361,14 @@ GputopUI.prototype.display_features = function(features) {
 
     if (features.get_fake_mode())
         $( "#metrics-tab-a" ).html("Metrics (Fake Mode) ");
+
+    gputop_ui.load_metrics_panel(function() {
+        var metric = gputop.get_map_metric(global_guid);
+
+        update_metric_period_exponent_for_zoom(metric);
+
+        gputop.open_oa_query_for_trace(global_guid);
+    });
 }
 
 // types of alerts: alert-success alert-info alert-warning alert-danger
