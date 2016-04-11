@@ -1695,7 +1695,7 @@ run_ncurses_ui(void *arg)
         pid = fork();
 
         if (pid != 0) {
-            char *exec_args[] = { "node",
+            char *exec_args[] = { "sudo", "node",
                 GPUTOP_NODEJS_ROOT "/gputop-nodejs-toolkit.js", tool, NULL };
             int i, err;
 
